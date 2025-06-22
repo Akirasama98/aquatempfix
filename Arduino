@@ -1,0 +1,155 @@
+#include <WiFi.h>
+#include <WiFiClientSecure.h>
+#include <PubSubClient.h>
+#include <OneWire.h>
+#include <DallasTemperature.h>
+#include <EEPROM.h>
+
+#define ONE_WIRE_BUS 33
+#define RELAY_HEATER 16
+#define RELAY_POMPA 5
+#define EEPROM_SIZE 64
+
+const char* ssid = "FASILKOM-ACCESS";
+const char* password = "Integer!";
+
+const char* mqtt_server = "2919163bbc8f43aca4ac29f7167d2890.s1.eu.hivemq.cloud";
+const int mqtt_port = 8883;
+const char* mqtt_user = "aquatemp-api";
+const char* mqtt_pass = "AquaTemp2025!";
+
+const char* mqtt_topic_control = "iot/device/control";
+const char* mqtt_topic_status = "iot/device/status";
+
+WiFiClientSecure secureClient;
+PubSubClient client(secureClient);
+
+OneWire oneWire(ONE_WIRE_BUS);
+DallasTemperature sensors(&oneWire);
+
+float suhu_min = 30.0, suhu_max = 40.0;
+bool mode_auto = true;
+bool heater_on = false, pompa_on = false;
+unsigned long lastMillis = 0;
+unsigned long lastPublish = 0;
+unsigned long heater_durasi = 0, pompa_durasi = 0;
+float last_temp_sent = -127.0;
+
+void setup_wifi() {
+WiFi.begin(ssid, password);
+while (WiFi.status() != WL_CONNECTED) delay(500);
+secureClient.setInsecure();
+}
+
+void reconnect() {
+while (!client.connected()) {
+if (client.connect("ESP32Client", mqtt_user, mqtt_pass)) {
+client.subscribe(mqtt_topic_control);
+} else {
+delay(5000);
+}
+}
+}
+
+void simpanDurasi() {
+EEPROM.put(0, heater_durasi);
+EEPROM.put(8, pompa_durasi);
+EEPROM.commit();
+}
+
+void bacaDurasi() {
+EEPROM.get(0, heater_durasi);
+EEPROM.get(8, pompa_durasi);
+}
+
+void updateRelay() {
+if (!mode_auto) {
+digitalWrite(RELAY_HEATER, HIGH);
+digitalWrite(RELAY_POMPA, HIGH);
+heater_on = false;
+pompa_on = false;
+return;
+}
+
+float suhu = sensors.getTempCByIndex(0);
+if (suhu <= suhu_min) {
+digitalWrite(RELAY_HEATER, LOW);
+digitalWrite(RELAY_POMPA, HIGH);
+heater_on = true;
+pompa_on = false;
+} else if (suhu >= suhu_max) {
+digitalWrite(RELAY_HEATER, HIGH);
+digitalWrite(RELAY_POMPA, LOW);
+heater_on = false;
+pompa_on = true;
+} else {
+digitalWrite(RELAY_HEATER, HIGH);
+digitalWrite(RELAY_POMPA, HIGH);
+heater_on = false;
+pompa_on = false;
+}
+}
+
+void callback(char* topic, byte* payload, unsigned int length) {
+String msg;
+for (int i = 0; i < length; i++) msg += (char)payload[i];
+msg.trim(); msg.toLowerCase();
+
+if (msg == "mode auto") mode_auto = true;
+else if (msg == "mode off") mode_auto = false;
+else if (msg.startsWith("set min ")) {
+float val = msg.substring(8).toFloat();
+if (val < suhu_max) suhu_min = val;
+}
+else if (msg.startsWith("set max ")) {
+float val = msg.substring(8).toFloat();
+if (val > suhu_min) suhu_max = val;
+}
+else if (msg == "reset durasi") {
+heater_durasi = 0;
+pompa_durasi = 0;
+simpanDurasi();
+}
+}
+
+void setup() {
+Serial.begin(115200);
+sensors.begin();
+pinMode(RELAY_HEATER, OUTPUT);
+pinMode(RELAY_POMPA, OUTPUT);
+digitalWrite(RELAY_HEATER, HIGH);
+digitalWrite(RELAY_POMPA, HIGH);
+EEPROM.begin(EEPROM_SIZE);
+bacaDurasi();
+
+setup_wifi();
+client.setServer(mqtt_server, mqtt_port);
+client.setCallback(callback);
+}
+
+void loop() {
+if (!client.connected()) reconnect();
+client.loop();
+
+sensors.requestTemperatures();
+float tempC = sensors.getTempCByIndex(0);
+
+if (tempC != DEVICE_DISCONNECTED_C) {
+unsigned long now = millis();
+if (now - lastPublish >= 1000) { // kirim setiap 1 detik
+String status = "Suhu: " + String(tempC) + " C, Mode: " + (mode_auto ? "Auto" : "Off") + ", Min: " + suhu_min + ", Max: " + suhu_max;
+status += ", Durasi Heater: " + String(heater_durasi) + "s, Durasi Pompa: " + String(pompa_durasi) + "s";
+client.publish(mqtt_topic_status, status.c_str());
+lastPublish = now;
+}
+}
+
+updateRelay();
+
+if (millis() - lastMillis >= 1000) {
+lastMillis = millis();
+if (heater_on) heater_durasi++;
+if (pompa_on) pompa_durasi++;
+simpanDurasi();
+}
+}
